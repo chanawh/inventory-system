@@ -1,22 +1,32 @@
 import sqlite3
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Get the absolute path to the directory containing this script.
-# `Path(__file__).parent` gets the script's directory.
-# `.parent` again moves up one level to the parent directory.
 script_directory = Path(__file__).parent.absolute()
 DATABASE = script_directory.parent / "inventory.db"
 
+def print_table(df):
+    print("\nInventory Table:")
+    print(df.to_string(index=False))
+
+def print_ascii_bar_chart(series):
+    print("\nInventory by Location (ASCII Bar Chart):")
+    max_label = max(len(str(label)) for label in series.index)
+    max_qty = series.max()
+    scale = 50 / max_qty if max_qty > 0 else 1
+    for loc, qty in series.items():
+        bar = "#" * int(qty * scale)
+        print(f"{loc.ljust(max_label)} | {bar} ({qty})")
+
 def visualize_inventory():
-    """Fetches data from the database and creates a bar chart."""
+    """Fetches data from the database and prints inventory as a table and ASCII bar chart."""
     try:
         # Check if the database file exists
         if not Path(DATABASE).exists():
             print(f"Error: Database file not found at {DATABASE}")
             return
-            
+
         conn = sqlite3.connect(DATABASE)
 
         # Read the entire 'inventory' table into a pandas DataFrame
@@ -30,18 +40,12 @@ def visualize_inventory():
             print("The inventory table is empty. Please insert data first.")
             return
 
+        print_table(df)
+
         # Group the data by location and sum the quantities
         inventory_by_location = df.groupby("location")["quantity"].sum()
 
-        # Create a bar chart
-        plt.figure(figsize=(10, 6))
-        inventory_by_location.plot(kind="bar", color="skyblue")
-        plt.title("Total Inventory by Location")
-        plt.xlabel("Location")
-        plt.ylabel("Total Quantity")
-        plt.xticks(rotation=45, ha="right") # Rotate labels for better readability
-        plt.tight_layout() # Adjust plot to ensure everything fits
-        plt.show()
+        print_ascii_bar_chart(inventory_by_location)
 
     except sqlite3.Error as e:
         print(f"Database error: {e}")
