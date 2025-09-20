@@ -1,15 +1,35 @@
-from fastapi import FastAPI, HTTPException, Query
+import os
+from fastapi import FastAPI, HTTPException, Query, Security, status, Depends
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, RootModel
 from typing import Dict, List, Optional
 import sqlite3
 
+DATABASE = "inventory.db"
+
+# --- API Key Auth Dependency ---
+API_KEY = os.environ.get("INVENTORY_API_KEY")
+if not API_KEY:
+    raise RuntimeError("INVENTORY_API_KEY environment variable not set!")
+
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+def get_api_key(api_key_header: str = Security(api_key_header)):
+    if api_key_header == API_KEY:
+        return api_key_header
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API Key",
+    )
+
+# --- FastAPI App ---
 app = FastAPI(
     title="Inventory Service API",
     description="API for tracking inventory by SKU and location, with filtering, pagination, and adjustment capabilities.",
     version="1.1.0",
+    dependencies=[Depends(get_api_key)],  # Require API key globally
 )
-
-DATABASE = "inventory.db"
 
 class Stock(BaseModel):
     sku: str
