@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import Dict, List
+from typing import Dict, List, Optional
 import sqlite3
 
 app = FastAPI()
@@ -27,18 +27,41 @@ def startup():
 
 @app.get("/inventory", response_model=List[Dict])
 def list_inventory(
+    sku: Optional[str] = Query(None, description="Filter by SKU"),
+    location: Optional[str] = Query(None, description="Filter by location"),
+    min_quantity: Optional[int] = Query(None, ge=0, description="Minimum quantity"),
+    max_quantity: Optional[int] = Query(None, ge=0, description="Maximum quantity"),
     limit: int = Query(100, ge=1, le=1000, description="Max number of items to return"),
     offset: int = Query(0, ge=0, description="Number of items to skip"),
 ):
     """
-    List all inventory entries as a list of dicts, with pagination.
+    List all inventory entries as a list of dicts, with filtering and pagination.
     """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-    c.execute(
-        "SELECT sku, location, quantity FROM inventory LIMIT ? OFFSET ?",
-        (limit, offset)
-    )
+
+    # Build WHERE clause dynamically
+    where = []
+    params = []
+
+    if sku:
+        where.append("sku=?")
+        params.append(sku)
+    if location:
+        where.append("location=?")
+        params.append(location)
+    if min_quantity is not None:
+        where.append("quantity>=?")
+        params.append(min_quantity)
+    if max_quantity is not None:
+        where.append("quantity<=?")
+        params.append(max_quantity)
+
+    where_clause = " WHERE " + " AND ".join(where) if where else ""
+    sql = f"SELECT sku, location, quantity FROM inventory{where_clause} LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    c.execute(sql, tuple(params))
     rows = c.fetchall()
     conn.close()
     return [{"sku": row[0], "location": row[1], "quantity": row[2]} for row in rows]
