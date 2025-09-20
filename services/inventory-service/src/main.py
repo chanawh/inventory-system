@@ -1,9 +1,13 @@
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 from typing import Dict, List, Optional
 import sqlite3
 
-app = FastAPI()
+app = FastAPI(
+    title="Inventory Service API",
+    description="API for tracking inventory by SKU and location, with filtering, pagination, and adjustment capabilities.",
+    version="1.1.0",
+)
 
 DATABASE = "inventory.db"
 
@@ -11,6 +15,17 @@ class Stock(BaseModel):
     sku: str
     location: str
     quantity: int
+
+class InventoryItem(BaseModel):
+    sku: str
+    location: str
+    quantity: int
+
+class InventoryByLocation(RootModel[Dict[str, int]]):
+    pass
+
+class MessageResponse(BaseModel):
+    detail: str
 
 def init_db():
     conn = sqlite3.connect(DATABASE)
@@ -25,7 +40,12 @@ def init_db():
 def startup():
     init_db()
 
-@app.get("/inventory", response_model=List[Dict])
+@app.get(
+    "/inventory",
+    response_model=List[InventoryItem],
+    tags=["Inventory"],
+    description="List all inventory entries, with optional filtering by SKU, location, quantity range, and pagination."
+)
 def list_inventory(
     sku: Optional[str] = Query(None, description="Filter by SKU"),
     location: Optional[str] = Query(None, description="Filter by location"),
@@ -64,9 +84,14 @@ def list_inventory(
     c.execute(sql, tuple(params))
     rows = c.fetchall()
     conn.close()
-    return [{"sku": row[0], "location": row[1], "quantity": row[2]} for row in rows]
+    return [InventoryItem(sku=row[0], location=row[1], quantity=row[2]) for row in rows]
 
-@app.get("/inventory/{sku}")
+@app.get(
+    "/inventory/{sku}",
+    response_model=InventoryByLocation,
+    tags=["Inventory"],
+    description="Get all locations and quantities for a given SKU."
+)
 def get_inventory(sku: str):
     """
     Get all locations and quantities for a given SKU.
@@ -80,7 +105,12 @@ def get_inventory(sku: str):
         raise HTTPException(status_code=404, detail="SKU not found")
     return {row[0]: row[1] for row in rows}
 
-@app.post("/inventory/{sku}/adjust")
+@app.post(
+    "/inventory/{sku}/adjust",
+    response_model=InventoryItem,
+    tags=["Inventory Adjustment"],
+    description="Adjust inventory for a SKU/location by a quantity amount (positive or negative)."
+)
 def adjust_inventory(sku: str, stock: Stock):
     """
     Adjust inventory for a SKU/location by a quantity amount (positive or negative).
@@ -100,6 +130,7 @@ def adjust_inventory(sku: str, stock: Stock):
             "UPDATE inventory SET quantity=? WHERE sku=? AND location=?",
             (new_quantity, sku, stock.location),
         )
+        returned_quantity = new_quantity
     else:
         if stock.quantity < 0:
             conn.close()
@@ -108,12 +139,18 @@ def adjust_inventory(sku: str, stock: Stock):
             "INSERT INTO inventory (sku, location, quantity) VALUES (?, ?, ?)",
             (sku, stock.location, stock.quantity),
         )
+        returned_quantity = stock.quantity
     conn.commit()
     conn.close()
     # Placeholder: publish inventory change event here
-    return {"sku": sku, "location": stock.location, "quantity": stock.quantity}
+    return InventoryItem(sku=sku, location=stock.location, quantity=returned_quantity)
 
-@app.delete("/inventory/{sku}")
+@app.delete(
+    "/inventory/{sku}",
+    response_model=MessageResponse,
+    tags=["Inventory"],
+    description="Delete all inventory entries for a specific SKU."
+)
 def delete_sku(sku: str):
     """
     Delete all inventory entries for a specific SKU.
@@ -126,9 +163,14 @@ def delete_sku(sku: str):
     conn.close()
     if changes == 0:
         raise HTTPException(status_code=404, detail="SKU not found")
-    return {"detail": f"Deleted all locations for SKU {sku}."}
+    return MessageResponse(detail=f"Deleted all locations for SKU {sku}.")
 
-@app.delete("/inventory/{sku}/{location}")
+@app.delete(
+    "/inventory/{sku}/{location}",
+    response_model=MessageResponse,
+    tags=["Inventory"],
+    description="Delete inventory for a SKU at a specific location."
+)
 def delete_sku_location(sku: str, location: str):
     """
     Delete inventory for a SKU at a specific location.
@@ -141,4 +183,4 @@ def delete_sku_location(sku: str, location: str):
     conn.close()
     if changes == 0:
         raise HTTPException(status_code=404, detail="SKU/location not found")
-    return {"detail": f"Deleted {sku} at {location}."}
+    return MessageResponse(detail=f"Deleted {sku} at {location}.")
