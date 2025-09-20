@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import Dict
+from typing import Dict, List
 import sqlite3
 
 app = FastAPI()
@@ -25,8 +25,29 @@ def init_db():
 def startup():
     init_db()
 
+@app.get("/inventory", response_model=List[Dict])
+def list_inventory(
+    limit: int = Query(100, ge=1, le=1000, description="Max number of items to return"),
+    offset: int = Query(0, ge=0, description="Number of items to skip"),
+):
+    """
+    List all inventory entries as a list of dicts, with pagination.
+    """
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT sku, location, quantity FROM inventory LIMIT ? OFFSET ?",
+        (limit, offset)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [{"sku": row[0], "location": row[1], "quantity": row[2]} for row in rows]
+
 @app.get("/inventory/{sku}")
 def get_inventory(sku: str):
+    """
+    Get all locations and quantities for a given SKU.
+    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute("SELECT location, quantity FROM inventory WHERE sku=?", (sku,))
@@ -38,6 +59,9 @@ def get_inventory(sku: str):
 
 @app.post("/inventory/{sku}/adjust")
 def adjust_inventory(sku: str, stock: Stock):
+    """
+    Adjust inventory for a SKU/location by a quantity amount (positive or negative).
+    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute(
@@ -65,3 +89,33 @@ def adjust_inventory(sku: str, stock: Stock):
     conn.close()
     # Placeholder: publish inventory change event here
     return {"sku": sku, "location": stock.location, "quantity": stock.quantity}
+
+@app.delete("/inventory/{sku}")
+def delete_sku(sku: str):
+    """
+    Delete all inventory entries for a specific SKU.
+    """
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("DELETE FROM inventory WHERE sku=?", (sku,))
+    changes = conn.total_changes
+    conn.commit()
+    conn.close()
+    if changes == 0:
+        raise HTTPException(status_code=404, detail="SKU not found")
+    return {"detail": f"Deleted all locations for SKU {sku}."}
+
+@app.delete("/inventory/{sku}/{location}")
+def delete_sku_location(sku: str, location: str):
+    """
+    Delete inventory for a SKU at a specific location.
+    """
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("DELETE FROM inventory WHERE sku=? AND location=?", (sku, location))
+    changes = conn.total_changes
+    conn.commit()
+    conn.close()
+    if changes == 0:
+        raise HTTPException(status_code=404, detail="SKU/location not found")
+    return {"detail": f"Deleted {sku} at {location}."}
