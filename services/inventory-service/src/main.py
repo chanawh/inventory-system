@@ -1,9 +1,11 @@
 import os
+import re
 from fastapi import FastAPI, HTTPException, Query, Security, status, Depends, Body
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, RootModel
 from typing import Dict, List, Optional
 import sqlite3
+import httpx
 
 DATABASE = "inventory.db"
 
@@ -27,7 +29,7 @@ def get_api_key(api_key_header: str = Security(api_key_header)):
 app = FastAPI(
     title="Inventory Service API",
     description="API for tracking inventory by SKU and location, with filtering, pagination, and adjustment capabilities.",
-    version="1.1.0",
+    version="1.2.0",
     dependencies=[Depends(get_api_key)],  # Require API key globally
 )
 
@@ -57,11 +59,20 @@ class BatchAdjustmentResult(BaseModel):
     success: bool
     error: Optional[str] = None
 
+class WebhookRegistration(BaseModel):
+    url: str
+
+class WebhookList(BaseModel):
+    urls: List[str]
+
 def init_db():
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute(
         "CREATE TABLE IF NOT EXISTS inventory (sku TEXT, location TEXT, quantity INTEGER, PRIMARY KEY(sku, location))"
+    )
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS webhooks (url TEXT PRIMARY KEY)"
     )
     conn.commit()
     conn.close()
@@ -69,6 +80,81 @@ def init_db():
 @app.on_event("startup")
 def startup():
     init_db()
+
+# --- Webhook Utilities ---
+
+def get_registered_webhooks() -> List[str]:
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("SELECT url FROM webhooks")
+    urls = [row[0] for row in c.fetchall()]
+    conn.close()
+    return urls
+
+def notify_webhooks(payload: dict):
+    urls = get_registered_webhooks()
+    if not urls:
+        return
+    for url in urls:
+        try:
+            # If Discord webhook, format differently
+            if re.match(r"^https://(discord(app)?\.com|discord\.com)/api/webhooks/", url):
+                content = (
+                    f"Inventory Event: {payload.get('event')}\n"
+                    f"SKU: {payload.get('sku')}\n"
+                    f"Location: {payload.get('location', 'N/A')}\n"
+                    f"Quantity: {payload.get('quantity', 'N/A')}\n"
+                    f"Adjustment: {payload.get('adjustment', 'N/A')}"
+                )
+                msg = {"content": content}
+                httpx.post(url, json=msg, timeout=3.0)
+            else:
+                httpx.post(url, json=payload, timeout=3.0)
+        except Exception as e:
+            pass  # Optionally log errors
+
+# --- Webhook Endpoints ---
+
+@app.post(
+    "/webhooks/register",
+    response_model=MessageResponse,
+    tags=["Webhooks"],
+    description="Register a webhook URL to receive inventory change notifications."
+)
+def register_webhook(reg: WebhookRegistration):
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT OR IGNORE INTO webhooks (url) VALUES (?)", (reg.url,))
+        conn.commit()
+    finally:
+        conn.close()
+    return MessageResponse(detail="Webhook registered.")
+
+@app.get(
+    "/webhooks",
+    response_model=WebhookList,
+    tags=["Webhooks"],
+    description="List all registered webhook URLs."
+)
+def list_webhooks():
+    return WebhookList(urls=get_registered_webhooks())
+
+@app.delete(
+    "/webhooks/register",
+    response_model=MessageResponse,
+    tags=["Webhooks"],
+    description="Unregister a webhook URL."
+)
+def unregister_webhook(reg: WebhookRegistration):
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("DELETE FROM webhooks WHERE url=?", (reg.url,))
+    conn.commit()
+    conn.close()
+    return MessageResponse(detail="Webhook unregistered.")
+
+# --- Inventory Endpoints (unchanged except for adding notify_webhooks calls) ---
 
 @app.get(
     "/inventory",
@@ -84,16 +170,10 @@ def list_inventory(
     limit: int = Query(100, ge=1, le=1000, description="Max number of items to return"),
     offset: int = Query(0, ge=0, description="Number of items to skip"),
 ):
-    """
-    List all inventory entries as a list of dicts, with filtering and pagination.
-    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-
-    # Build WHERE clause dynamically
     where = []
     params = []
-
     if sku:
         where.append("sku=?")
         params.append(sku)
@@ -106,11 +186,9 @@ def list_inventory(
     if max_quantity is not None:
         where.append("quantity<=?")
         params.append(max_quantity)
-
     where_clause = " WHERE " + " AND ".join(where) if where else ""
     sql = f"SELECT sku, location, quantity FROM inventory{where_clause} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
-
     c.execute(sql, tuple(params))
     rows = c.fetchall()
     conn.close()
@@ -123,9 +201,6 @@ def list_inventory(
     description="Get all locations and quantities for a given SKU."
 )
 def get_inventory(sku: str):
-    """
-    Get all locations and quantities for a given SKU.
-    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute("SELECT location, quantity FROM inventory WHERE sku=?", (sku,))
@@ -142,9 +217,6 @@ def get_inventory(sku: str):
     description="Adjust inventory for a SKU/location by a quantity amount (positive or negative)."
 )
 def adjust_inventory(sku: str, stock: Stock):
-    """
-    Adjust inventory for a SKU/location by a quantity amount (positive or negative).
-    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute(
@@ -172,7 +244,14 @@ def adjust_inventory(sku: str, stock: Stock):
         returned_quantity = stock.quantity
     conn.commit()
     conn.close()
-    # Placeholder: publish inventory change event here
+    # Notify webhooks
+    notify_webhooks({
+        "event": "inventory_adjusted",
+        "sku": sku,
+        "location": stock.location,
+        "quantity": returned_quantity,
+        "adjustment": stock.quantity
+    })
     return InventoryItem(sku=sku, location=stock.location, quantity=returned_quantity)
 
 @app.post(
@@ -182,13 +261,10 @@ def adjust_inventory(sku: str, stock: Stock):
     description="Batch adjust inventory for multiple SKU/location pairs. Returns per-item success/errors."
 )
 def batch_adjust_inventory(adjustments: BatchStock = Body(...)):
-    """
-    Batch adjust inventory for multiple SKU/location pairs.
-    Returns per-item success/errors.
-    """
     results = []
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
+    notifications = []
     for stock in adjustments.root:
         try:
             c.execute(
@@ -231,6 +307,13 @@ def batch_adjust_inventory(adjustments: BatchStock = Body(...)):
                 quantity=returned_quantity,
                 success=True
             ))
+            notifications.append({
+                "event": "inventory_adjusted",
+                "sku": stock.sku,
+                "location": stock.location,
+                "quantity": returned_quantity,
+                "adjustment": stock.quantity
+            })
         except Exception as e:
             results.append(BatchAdjustmentResult(
                 sku=stock.sku,
@@ -240,6 +323,8 @@ def batch_adjust_inventory(adjustments: BatchStock = Body(...)):
             ))
     conn.commit()
     conn.close()
+    for note in notifications:
+        notify_webhooks(note)
     return results
 
 @app.delete(
@@ -249,9 +334,6 @@ def batch_adjust_inventory(adjustments: BatchStock = Body(...)):
     description="Delete all inventory entries for a specific SKU."
 )
 def delete_sku(sku: str):
-    """
-    Delete all inventory entries for a specific SKU.
-    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute("DELETE FROM inventory WHERE sku=?", (sku,))
@@ -260,6 +342,10 @@ def delete_sku(sku: str):
     conn.close()
     if changes == 0:
         raise HTTPException(status_code=404, detail="SKU not found")
+    notify_webhooks({
+        "event": "inventory_deleted",
+        "sku": sku,
+    })
     return MessageResponse(detail=f"Deleted all locations for SKU {sku}.")
 
 @app.delete(
@@ -269,9 +355,6 @@ def delete_sku(sku: str):
     description="Delete inventory for a SKU at a specific location."
 )
 def delete_sku_location(sku: str, location: str):
-    """
-    Delete inventory for a SKU at a specific location.
-    """
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute("DELETE FROM inventory WHERE sku=? AND location=?", (sku, location))
@@ -280,4 +363,9 @@ def delete_sku_location(sku: str, location: str):
     conn.close()
     if changes == 0:
         raise HTTPException(status_code=404, detail="SKU/location not found")
+    notify_webhooks({
+        "event": "inventory_deleted",
+        "sku": sku,
+        "location": location,
+    })
     return MessageResponse(detail=f"Deleted {sku} at {location}.")
