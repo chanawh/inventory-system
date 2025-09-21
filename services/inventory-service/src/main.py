@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, HTTPException, Query, Security, status, Depends
+from fastapi import FastAPI, HTTPException, Query, Security, status, Depends, Body
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, RootModel
 from typing import Dict, List, Optional
@@ -46,6 +46,16 @@ class InventoryByLocation(RootModel[Dict[str, int]]):
 
 class MessageResponse(BaseModel):
     detail: str
+
+class BatchStock(RootModel[List[Stock]]):
+    pass
+
+class BatchAdjustmentResult(BaseModel):
+    sku: str
+    location: str
+    quantity: Optional[int] = None
+    success: bool
+    error: Optional[str] = None
 
 def init_db():
     conn = sqlite3.connect(DATABASE)
@@ -164,6 +174,73 @@ def adjust_inventory(sku: str, stock: Stock):
     conn.close()
     # Placeholder: publish inventory change event here
     return InventoryItem(sku=sku, location=stock.location, quantity=returned_quantity)
+
+@app.post(
+    "/inventory/batch_adjust",
+    response_model=List[BatchAdjustmentResult],
+    tags=["Inventory Adjustment"],
+    description="Batch adjust inventory for multiple SKU/location pairs. Returns per-item success/errors."
+)
+def batch_adjust_inventory(adjustments: BatchStock = Body(...)):
+    """
+    Batch adjust inventory for multiple SKU/location pairs.
+    Returns per-item success/errors.
+    """
+    results = []
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    for stock in adjustments.root:
+        try:
+            c.execute(
+                "SELECT quantity FROM inventory WHERE sku=? AND location=?",
+                (stock.sku, stock.location)
+            )
+            row = c.fetchone()
+            if row:
+                new_quantity = row[0] + stock.quantity
+                if new_quantity < 0:
+                    results.append(BatchAdjustmentResult(
+                        sku=stock.sku,
+                        location=stock.location,
+                        success=False,
+                        error="Insufficient stock"
+                    ))
+                    continue
+                c.execute(
+                    "UPDATE inventory SET quantity=? WHERE sku=? AND location=?",
+                    (new_quantity, stock.sku, stock.location)
+                )
+                returned_quantity = new_quantity
+            else:
+                if stock.quantity < 0:
+                    results.append(BatchAdjustmentResult(
+                        sku=stock.sku,
+                        location=stock.location,
+                        success=False,
+                        error="Insufficient stock"
+                    ))
+                    continue
+                c.execute(
+                    "INSERT INTO inventory (sku, location, quantity) VALUES (?, ?, ?)",
+                    (stock.sku, stock.location, stock.quantity)
+                )
+                returned_quantity = stock.quantity
+            results.append(BatchAdjustmentResult(
+                sku=stock.sku,
+                location=stock.location,
+                quantity=returned_quantity,
+                success=True
+            ))
+        except Exception as e:
+            results.append(BatchAdjustmentResult(
+                sku=stock.sku,
+                location=stock.location,
+                success=False,
+                error=str(e)
+            ))
+    conn.commit()
+    conn.close()
+    return results
 
 @app.delete(
     "/inventory/{sku}",
