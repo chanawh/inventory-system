@@ -1,9 +1,8 @@
-# ... (existing imports and code)
-
 from fastapi import FastAPI, HTTPException, status, Body
 from pydantic import BaseModel, Field
 from typing import List, Optional
-import sqlite3
+import aiosqlite
+import asyncio
 
 DATABASE = "orders.db"
 
@@ -25,65 +24,55 @@ class Order(BaseModel):
     items: List[OrderItem]
     status: str
 
-def init_db():
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT)"
-    )
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS order_items (order_id INTEGER, sku TEXT, quantity INTEGER)"
-    )
-    conn.commit()
-    conn.close()
+async def init_db():
+    async with aiosqlite.connect(DATABASE) as conn:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT)"
+        )
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS order_items (order_id INTEGER, sku TEXT, quantity INTEGER)"
+        )
+        await conn.commit()
 
 @app.on_event("startup")
-def startup():
-    init_db()
+async def startup():
+    await init_db()
 
 @app.post("/orders", response_model=Order, status_code=status.HTTP_201_CREATED)
-def create_order(order: OrderCreate):
-    # TODO: Call inventory microservice to reserve/deduct stock
-    # For now, just store the order
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute("INSERT INTO orders (status) VALUES (?)", ("pending",))
-    order_id = c.lastrowid
-    for item in order.items:
-        c.execute(
-            "INSERT INTO order_items (order_id, sku, quantity) VALUES (?, ?, ?)",
-            (order_id, item.sku, item.quantity)
-        )
-    conn.commit()
-    conn.close()
+async def create_order(order: OrderCreate):
+    async with aiosqlite.connect(DATABASE) as conn:
+        cursor = await conn.execute("INSERT INTO orders (status) VALUES (?)", ("pending",))
+        order_id = cursor.lastrowid
+        for item in order.items:
+            await conn.execute(
+                "INSERT INTO order_items (order_id, sku, quantity) VALUES (?, ?, ?)",
+                (order_id, item.sku, item.quantity)
+            )
+        await conn.commit()
     return Order(id=order_id, items=order.items, status="pending")
 
-# --- New endpoints below ---
-
 @app.get("/orders", response_model=List[Order])
-def list_orders():
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute("SELECT id, status FROM orders")
+async def list_orders():
     orders = []
-    for order_id, status in c.fetchall():
-        c.execute("SELECT sku, quantity FROM order_items WHERE order_id=?", (order_id,))
-        items = [OrderItem(sku=sku, quantity=quantity) for sku, quantity in c.fetchall()]
-        orders.append(Order(id=order_id, items=items, status=status))
-    conn.close()
+    async with aiosqlite.connect(DATABASE) as conn:
+        async with conn.execute("SELECT id, status FROM orders") as cursor:
+            order_rows = await cursor.fetchall()
+            for order_id, status in order_rows:
+                async with conn.execute("SELECT sku, quantity FROM order_items WHERE order_id=?", (order_id,)) as items_cursor:
+                    items_rows = await items_cursor.fetchall()
+                    items = [OrderItem(sku=sku, quantity=quantity) for sku, quantity in items_rows]
+                orders.append(Order(id=order_id, items=items, status=status))
     return orders
 
 @app.get("/orders/{order_id}", response_model=Order)
-def get_order(order_id: int):
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute("SELECT status FROM orders WHERE id=?", (order_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Order not found")
-    status = row[0]
-    c.execute("SELECT sku, quantity FROM order_items WHERE order_id=?", (order_id,))
-    items = [OrderItem(sku=sku, quantity=quantity) for sku, quantity in c.fetchall()]
-    conn.close()
+async def get_order(order_id: int):
+    async with aiosqlite.connect(DATABASE) as conn:
+        async with conn.execute("SELECT status FROM orders WHERE id=?", (order_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Order not found")
+            status = row[0]
+        async with conn.execute("SELECT sku, quantity FROM order_items WHERE order_id=?", (order_id,)) as items_cursor:
+            items_rows = await items_cursor.fetchall()
+            items = [OrderItem(sku=sku, quantity=quantity) for sku, quantity in items_rows]
     return Order(id=order_id, items=items, status=status)
